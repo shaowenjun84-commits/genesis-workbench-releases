@@ -1,0 +1,62 @@
+name: Publish verified installer
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+      installer_url:
+        required: true
+        type: string
+      installer_sha256:
+        required: true
+        type: string
+      release_notes:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch and verify installer only
+        env:
+          INSTALLER_URL: ${{ inputs.installer_url }}
+          INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          echo "::add-mask::$INSTALLER_URL"
+          node <<'NODE'
+          const fs=require('fs'),crypto=require('crypto'),assert=require('assert/strict'),{Readable}=require('stream'),{pipeline}=require('stream/promises');
+          (async()=>{const url=new URL(process.env.INSTALLER_URL);assert.equal(url.protocol,'https:');assert.equal(url.hostname,'release-assets.githubusercontent.com');
+          const version=process.env.VERSION;assert(/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?$/.test(version));assert(/^[a-f0-9]{64}$/.test(process.env.INSTALLER_SHA256));
+          const name='Genesis-Workbench-'+version+'-windows-x64-setup.exe';
+          const res=await fetch(url,{redirect:'error',signal:AbortSignal.timeout(180000)});assert(res.ok,'Installer download failed');
+          await pipeline(Readable.fromWeb(res.body),fs.createWriteStream(name));
+          const sha=crypto.createHash('sha256').update(fs.readFileSync(name)).digest('hex');assert.equal(sha,process.env.INSTALLER_SHA256);
+          fs.writeFileSync('SHA256SUMS.txt',sha+'  '+name+'\n');fs.writeFileSync('release-notes.md',process.env.RELEASE_NOTES);
+          console.log(JSON.stringify({version,bytes:fs.statSync(name).size,sha256:sha}));})().catch(e=>{console.error(e.message);process.exitCode=1});
+          NODE
+      - name: Publish public installer and checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
+        run: |
+          node <<'NODE'
+          const fs=require('fs'),assert=require('assert/strict'),{execFileSync}=require('child_process');
+          const run=(args,input)=>execFileSync('gh',args,{encoding:'utf8',input,stdio:['pipe','pipe','pipe']}).trim();
+          const tag='v'+process.env.VERSION,name='Genesis-Workbench-'+process.env.VERSION+'-windows-x64-setup.exe',repo=process.env.GH_REPO;
+          assert.equal(JSON.parse(run(['repo','view',repo,'--json','visibility'])).visibility,'PUBLIC');
+          let release=JSON.parse(run(['api','repos/'+repo+'/releases?per_page=100'])).find(r=>r.tag_name===tag);
+          if(!release){run(['release','create',tag,'--draft','--prerelease','--title','创世视觉工作台 '+process.env.VERSION,'--notes-file','release-notes.md']);release=JSON.parse(run(['api','repos/'+repo+'/releases?per_page=100'])).find(r=>r.tag_name===tag);}
+          assert(release?.draft,'An unpublished draft is required');
+          run(['release','upload',tag,name,'SHA256SUMS.txt','--clobber']);
+          const updated=JSON.parse(run(['api','repos/'+repo+'/releases/'+release.id]));assert.deepEqual(updated.assets.map(a=>a.name).sort(),[name,'SHA256SUMS.txt'].sort());
+          const asset=updated.assets.find(a=>a.name===name);assert.equal(asset.digest,'sha256:'+process.env.INSTALLER_SHA256);assert.equal(asset.size,fs.statSync(name).size);
+          run(['api','--method','PATCH','repos/'+repo+'/releases/'+release.id,'--input','-'],JSON.stringify({tag_name:tag,target_commitish:updated.target_commitish,draft:false}));console.log('Verified public installer published.');
+          NODE
